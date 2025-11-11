@@ -21,6 +21,34 @@ use reth_rpc_eth_types::TransactionDataAndReceipt;
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
 use tracing::trace;
 
+///Custom imports
+use futures::join;
+
+use alloy_primitives::map::HashSet;
+use alloy_rpc_types_trace::parity::{TraceResultsWithTransactionHash, TraceType};
+
+use alloy_rpc_types::Block;
+//use alloy_rpc_types::Withdrawals;
+use alloy_rpc_types_eth::{BlockTransactions, Header};
+
+use alloy_consensus::TxEnvelope;
+
+use alloy_network::{ReceiptResponse, TransactionResponse};
+
+use reth_node_api::BlockBody;
+
+use alloy_primitives::Signature as Alloy_Signature;
+use revm_inspectors::tracing::TracingInspectorConfig;
+use revm_primitives::{hex, FixedBytes};
+
+use jsonrpsee_types::ErrorObjectOwned;
+
+use crate::helpers::data::{EnrichedBlock, EnrichedTransaction};
+
+use alloy_rpc_types_trace::parity::LocalizedTransactionTrace;
+//use revm_inspectors::tracing::parity::populate_state_diff;
+//Custom imports
+
 /// Helper trait, unifies functionality that must be supported to implement all RPC methods for
 /// server.
 pub trait FullEthApiServer:
@@ -82,6 +110,13 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
     /// Returns information about a block by number.
     #[method(name = "getBlockByNumber")]
     async fn block_by_number(&self, number: BlockNumberOrTag, full: bool) -> RpcResult<Option<B>>;
+
+    /// Returns  all information about a block and transactions.
+    #[method(name = "getBlockReceiptsTrace")]
+    async fn block_receipts_trace(
+        &self,
+        number: BlockNumberOrTag,
+    ) -> RpcResult<Option<EnrichedBlock>>;
 
     /// Returns the number of transactions in a block from a block matching the given block hash.
     #[method(name = "getBlockTransactionCountByHash")]
@@ -249,7 +284,11 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
     /// If `full` is true, the block object will contain all transaction objects,
     /// otherwise it will only contain the transaction hashes.
     #[method(name = "getFinalizedBlock")]
-    async fn finalized_block(&self, verified_validator_num: u64, full: bool) -> RpcResult<Option<B>>;
+    async fn finalized_block(
+        &self,
+        verified_validator_num: u64,
+        full: bool,
+    ) -> RpcResult<Option<B>>;
 
     /// `eth_simulateV1` executes an arbitrary number of transactions on top of the requested state.
     /// The transactions are packed into individual blocks. Overrides can be provided.
@@ -491,6 +530,318 @@ where
         trace!(target: "rpc::eth", ?number, ?full, "Serving eth_getBlockByNumber");
         check_pending_tag(&number)?;
         Ok(EthBlocks::rpc_block(self, number.into(), full).await?)
+    }
+
+    /// Handler for: `eth_getBlockReceiptTrace`
+    async fn block_receipts_trace(
+        &self,
+        number: BlockNumberOrTag,
+    ) -> RpcResult<Option<EnrichedBlock>> {
+        trace!(target: "rpc::eth", ?number, ?true, "Serving eth_getBlockReceiptTrace");
+
+        let trace_task = tokio::spawn({
+            let self_clone = self.clone();
+
+            async move {
+                let mut trace_types: HashSet<TraceType> = HashSet::default();
+                trace_types.insert(TraceType::Trace);
+
+                let block_id = BlockId::Number(number);
+
+                self_clone
+                    .trace_block_with(
+                        block_id,
+                        None,
+                        TracingInspectorConfig::from_parity_config(&trace_types),
+                        move |tx_info, mut ctx| {
+                            let full_trace = ctx
+                                .take_inspector()
+                                .into_parity_builder()
+                                .into_trace_results(&ctx.result, &trace_types);
+
+                            // if let Some(ref mut state_diff) = full_trace.state_diff {
+                            //     populate_state_diff(state_diff, &ctx.db, ctx.state.iter())
+                            //         .map_err(|trace_res_err| {
+                            //             ErrorObjectOwned::owned(
+                            //                 1,
+                            //                 format!(
+                            //                     "Error getting block traces result {} for block{}",
+                            //                     trace_res_err, number
+                            //                 ),
+                            //                 None::<()>,
+                            //             )
+                            //         })?;
+                            // }
+
+                            let trace = TraceResultsWithTransactionHash {
+                                transaction_hash: tx_info.hash.expect("tx hash is set"),
+                                full_trace,
+                            };
+                            Ok(trace)
+                        },
+                    )
+                    .await
+            }
+        });
+
+        let receipts_task = tokio::spawn({
+            let self_clone = self.clone();
+
+            async move { EthBlocks::block_receipts(&self_clone, number.into()).await }
+        });
+
+        let (trx_traces_handle, trx_receipts_handle) = join!(trace_task, receipts_task);
+
+        let trx_traces_handle_res = trx_traces_handle
+            .map_err(|handle_err| {
+                ErrorObjectOwned::owned(
+                    1,
+                    format!(
+                        "Error in traces join handle for block number {}: {}",
+                        number, handle_err
+                    ),
+                    None::<()>,
+                )
+            })?
+            .map_err(|trace_res_err| {
+                ErrorObjectOwned::owned(
+                    1,
+                    format!(
+                        "Error getting block traces result {} for block{}",
+                        trace_res_err, number
+                    ),
+                    None::<()>,
+                )
+            })
+            .and_then(|traces_option| {
+                traces_option.ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        1,
+                        format!("Error getting block traces option for block {}", number),
+                        None::<()>,
+                    )
+                })
+            });
+
+        let trx_receipts_handle_res = trx_receipts_handle
+            .map_err(|handle_err| {
+                ErrorObjectOwned::owned(
+                    1,
+                    format!(
+                        "Error in transaction receipts for block number {}: {}",
+                        number, handle_err
+                    ),
+                    None::<()>,
+                )
+            })?
+            .map_err(|receipt_res_err| {
+                ErrorObjectOwned::owned(
+                    2,
+                    format!(
+                        "Error getting transaction receipts result {} for block {}",
+                        receipt_res_err, number
+                    ),
+                    None::<()>,
+                )
+            })
+            .and_then(|receipts_option| {
+                receipts_option.ok_or_else(|| {
+                    ErrorObjectOwned::owned(
+                        2,
+                        format!("Error getting transaction receipts option for block{}", number),
+                        None::<()>,
+                    )
+                })
+            });
+
+        let trx_traces = trx_traces_handle_res?;
+        let trx_receipts = trx_receipts_handle_res?;
+
+        let block = EthBlocks::rpc_block(self, BlockId::Number(number), true).await?.unwrap();
+
+        let block_rewards_task = tokio::spawn({
+            let self_clone = self.clone();
+
+            let number = number.as_number().unwrap();
+
+            async move {
+                let maybe_block =
+                    self_clone.recovered_block(BlockId::number(number)).await.unwrap();
+                let mut trace_rewards: Vec<LocalizedTransactionTrace> = Vec::new();
+
+                if let Some(block) = maybe_block {
+                    if let Ok(Some(base_block_reward)) =
+                        self_clone.calculate_base_block_reward(block.header())
+                    {
+                        trace_rewards.extend(self_clone.extract_reward_traces(
+                            block.header(),
+                            block.body().ommers(),
+                            base_block_reward,
+                        ));
+                    }
+                }
+
+                trace_rewards
+            }
+        });
+
+        if trx_receipts.len() != block.transactions.len() {
+            let trx_trace_len_error = ErrorObjectOwned::owned(
+                1,
+                "trx_receipts.size() != block.transactions.size()",
+                None::<()>,
+            );
+            return Err(trx_trace_len_error);
+        }
+
+        if trx_traces.len() != block.transactions.len() {
+            let trx_trace_len_error = ErrorObjectOwned::owned(
+                1,
+                "trx_traces.size() != block.transactions.size()",
+                None::<()>,
+            );
+            return Err(trx_trace_len_error);
+        }
+
+        let mut enriched_trxs: Vec<EnrichedTransaction> = Vec::new();
+
+        if let BlockTransactions::Full(transactions) = block.transactions {
+            let trx_iter = transactions.into_iter();
+            let receipts_iter = trx_receipts.into_iter();
+            let trace_iter = trx_traces.into_iter();
+
+            for ((trx, receipt), trace) in trx_iter.zip(receipts_iter).zip(trace_iter) {
+                if trx.tx_hash() != receipt.transaction_hash()
+                    || trx.tx_hash() != trace.transaction_hash
+                {
+                    let trx_trace_hash_error = ErrorObjectOwned::owned(
+                        2,
+                        format!(
+                            "Mismatch between transaction hash and corresponding receipt hash {}",
+                            trx.tx_hash()
+                        ),
+                        None::<()>,
+                    );
+                    return Err(trx_trace_hash_error);
+                }
+
+                let json_trx = serde_json::to_string(&trx).unwrap();
+                let json_receipt = serde_json::to_string(&receipt).unwrap();
+
+                let (alloy_trx, alloy_receipt);
+
+                alloy_trx =
+                    serde_json::from_str::<alloy_rpc_types_eth::Transaction>(&json_trx).unwrap();
+                alloy_receipt =
+                    serde_json::from_str::<alloy_rpc_types_eth::TransactionReceipt>(&json_receipt)
+                        .unwrap();
+
+                let alloy_public_key;
+
+                let mut tx_message_hash: Option<FixedBytes<32>> = None;
+                let mut tx_sig: Option<Alloy_Signature> = None;
+
+                match TxEnvelope::try_from(alloy_trx.inner.inner().clone()) {
+                    Ok(tx_envelope) => match tx_envelope {
+                        TxEnvelope::Legacy(typed_tx) => {
+                            tx_message_hash = Some(typed_tx.signature_hash());
+                            tx_sig = Some(typed_tx.signature().clone());
+                        }
+                        TxEnvelope::Eip1559(typed_tx) => {
+                            tx_message_hash = Some(typed_tx.signature_hash());
+                            tx_sig = Some(typed_tx.signature().clone());
+                        }
+                        TxEnvelope::Eip2930(typed_tx) => {
+                            tx_message_hash = Some(typed_tx.signature_hash());
+                            tx_sig = Some(typed_tx.signature().clone());
+                        }
+                        TxEnvelope::Eip4844(typed_tx) => {
+                            tx_message_hash = Some(typed_tx.signature_hash());
+                            tx_sig = Some(typed_tx.signature().clone());
+                        }
+                        TxEnvelope::Eip7702(typed_tx) => {
+                            tx_message_hash = Some(typed_tx.signature_hash());
+                            tx_sig = Some(typed_tx.signature().clone());
+                        }
+                    },
+                    Err(e) => {
+                        println!("Conversion error: {:?}", e);
+                    }
+                } //match TxEnvelope::try_from
+
+                if tx_sig.is_none() || tx_message_hash.is_none() {
+                    let trx_sig_error = ErrorObjectOwned::owned(
+                        1,
+                        format!("Signature not extracted from transaction {}", trx.tx_hash()),
+                        None::<()>,
+                    );
+                    return Err(trx_sig_error);
+                }
+
+                let check_address: Address;
+                let alloy_sig = tx_sig.unwrap().recover_from_prehash(&tx_message_hash.unwrap());
+
+                match alloy_sig {
+                    Ok(signature) => {
+                        let ec = signature.to_encoded_point(true);
+
+                        check_address = Address::from_public_key(&signature);
+                        alloy_public_key = format!("0x{}", hex::encode(ec.as_bytes()));
+                    }
+                    Err(p_key_err) => {
+                        let alloy_pub_key_err = ErrorObjectOwned::owned(
+                                1,
+                                format!("Public key not extracted from message and signature, error: {}, transaction hash: {}"
+                                        , p_key_err, trx.tx_hash()),
+                                None::<()>,
+                            );
+                        return Err(alloy_pub_key_err);
+                    }
+                }
+
+                if check_address != trx.from() {
+                    let trx_pub_key_addr_error = ErrorObjectOwned::owned(
+                        1,
+                        format!(
+                            "Address doesn't match public key to address for {}",
+                            trx.tx_hash()
+                        ),
+                        None::<()>,
+                    );
+                    return Err(trx_pub_key_addr_error);
+                }
+
+                enriched_trxs.push(EnrichedTransaction {
+                    inner: alloy_trx,
+                    public_key: if alloy_public_key.is_empty() {
+                        "0x0".to_string()
+                    } else {
+                        alloy_public_key
+                    }
+                    .to_string(),
+                    receipts: alloy_receipt,
+                    trace: trace.full_trace,
+                });
+            }
+        }
+        let json_header = serde_json::to_string(&block.header).unwrap();
+        let block_header: Header = serde_json::from_str(&json_header).unwrap();
+
+        let e_block: Block<EnrichedTransaction> = Block {
+            header: block_header,
+            uncles: block.uncles,
+            transactions: BlockTransactions::Full(enriched_trxs),
+            withdrawals: block.withdrawals,
+        };
+
+        #[allow(unused_assignments, unused_mut)]
+        let mut block_rewards = vec![];
+
+        block_rewards = block_rewards_task.await.unwrap();
+
+        let rich_block: EnrichedBlock = EnrichedBlock { inner: e_block, rewards: block_rewards };
+
+        Ok(Some(rich_block))
     }
 
     /// Handler for: `eth_getBlockTransactionCountByHash`
@@ -756,13 +1107,20 @@ where
     }
 
     /// Handler for: `eth_getFinalizedHeader`
-    async fn finalized_header(&self, verified_validator_num: u64) -> RpcResult<Option<RpcHeader<T::NetworkTypes>>> {
+    async fn finalized_header(
+        &self,
+        verified_validator_num: u64,
+    ) -> RpcResult<Option<RpcHeader<T::NetworkTypes>>> {
         trace!(target: "rpc::eth", verified_validator_num, "Serving eth_getFinalizedHeader");
         Ok(EthBlocks::rpc_finalized_header(self, verified_validator_num).await?)
     }
 
     /// Handler for: `eth_getFinalizedBlock`
-    async fn finalized_block(&self, verified_validator_num: u64, full: bool) -> RpcResult<Option<RpcBlock<T::NetworkTypes>>> {
+    async fn finalized_block(
+        &self,
+        verified_validator_num: u64,
+        full: bool,
+    ) -> RpcResult<Option<RpcBlock<T::NetworkTypes>>> {
         trace!(target: "rpc::eth", verified_validator_num, ?full, "Serving eth_getFinalizedBlock");
         Ok(EthBlocks::rpc_finalized_block(self, verified_validator_num, full).await?)
     }
