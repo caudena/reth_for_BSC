@@ -52,6 +52,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod cli;
+/// rpc_ext
+pub mod rpc_ext;
 
 /// Re-exported utils.
 pub mod utils {

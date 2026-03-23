@@ -14,6 +14,8 @@ use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
+use reth::rpc_ext::{self, EthBlockReceiptsTraceApiServer};
+
 fn main() {
     reth_cli_util::sigsegv_handler::install();
 
@@ -26,7 +28,14 @@ fn main() {
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
             let NodeHandle { node, node_exit_future } =
-                builder.node(EthereumNode::default()).launch_with_debug_capabilities().await?;
+                builder.node(EthereumNode::default())
+                    .extend_rpc_modules(move |ctx| {
+                        let trace_ext =
+                            rpc_ext::EthBlockReceiptsTraceExt::new(ctx.registry.eth_api().clone());
+                        ctx.modules.merge_configured(trace_ext.into_rpc())?;
+                        Ok(())
+                    })
+                    .launch_with_debug_capabilities().await?;
 
             // Install ress subprotocol.
             if ress_args.enabled {
