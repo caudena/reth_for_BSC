@@ -648,7 +648,7 @@ jsonrpsee-types = "0.26.0"
 http = "1.0"
 http-body = "1.0"
 http-body-util = "0.1.2"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 proptest-arbitrary-interop = "0.1.0"
 
 # crypto
