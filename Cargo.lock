@@ -677,7 +677,7 @@ dependencies = [
  "derive_more",
  "ethereum_ssz",
  "ethereum_ssz_derive",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "rand 0.8.5",
  "serde",
  "strum 0.27.2",
@@ -5502,6 +5502,22 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "10.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0529410abe238729a60b108898784df8984c87f6054c9c4fcacc47e4803c1ce1"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "pem",
+ "serde",
+ "serde_json",
+ "signature",
  "simple_asn1",
 ]
 
@@ -10433,7 +10449,7 @@ dependencies = [
  "itertools 0.14.0",
  "jsonrpsee",
  "jsonrpsee-types",
- "jsonwebtoken",
+ "jsonwebtoken 10.3.0",
  "parking_lot",
  "pin-project",
  "rand 0.9.2",
