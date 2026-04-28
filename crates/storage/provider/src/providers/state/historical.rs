@@ -369,40 +369,28 @@ impl<
                         });
                     }
 
-                    // For small gaps, probe AccountChangeSets for this address in the gap
-                    // (hist_tip, exec_tip]. AccountChangeSets and PlainState are committed
-                    // atomically by the Execution stage, so they are complete through exec_tip.
-                    match self.earliest_account_changeset_in_gap(
-                        *address,
-                        hist_tip,
-                        exec_tip,
-                    )? {
-                        None => {
-                            // Address was not touched in the gap — PlainState holds the
-                            // correct value since no modification has occurred since before
-                            // hist_tip.
-                        }
-                        Some((gap_block, account_before)) => {
-                            if gap_block >= self.block_number {
-                                // The first modification in the gap is at or after the queried
-                                // block. By the InPlainState invariant, no modification exists
-                                // in (self.block_number, hist_tip] (when block_number ≤ hist_tip),
-                                // so `account_before` is the value at self.block_number.
-                                // When block_number > hist_tip and gap_block ≥ block_number,
-                                // no modification in (hist_tip, block_number) means
-                                // `account_before` equals the value at block_number.
-                                return Ok(account_before);
-                            }
-                            // gap_block < self.block_number implies block_number > hist_tip
-                            // and a modification exists in the gap before the queried block.
-                            // Recovering the exact value requires replaying all changesets in
-                            // (hist_tip, block_number], which is not supported here.
-                            return Err(ProviderError::HistoryStateInconsistent {
-                                block: self.block_number,
-                                execution_tip: exec_tip,
-                                history_tip: hist_tip,
-                            });
-                        }
+                    // Probe AccountChangeSets for the first modification of `address` in
+                    // (max(block_number, hist_tip), exec_tip]. AccountChangeSets and PlainState
+                    // are committed atomically by the Execution stage, so they are complete
+                    // through exec_tip.
+                    //
+                    // We start the scan at max(block_number, hist_tip) instead of block_number
+                    // because the InPlainState result guarantees no changeset for this address
+                    // exists in (block_number, hist_tip] — narrowing the scan saves walking
+                    // many irrelevant entries when block_number << hist_tip.
+                    //
+                    // If found at block N (N > block_number): changeset[N].info is the value
+                    // at end of N-1. Since N is the first changeset for this address after
+                    // block_number, nothing modified it in (block_number, N-1], so this is
+                    // also the value at end of block_number.
+                    //
+                    // If not found: the address was not touched after block_number, so
+                    // PlainState (current at exec_tip) still reflects the value at block_number.
+                    let scan_after = self.block_number.max(hist_tip);
+                    if let Some((_, account_before)) = self
+                        .earliest_account_changeset_in_gap(*address, scan_after, exec_tip)?
+                    {
+                        return Ok(account_before);
                     }
                 }
                 Ok(self.tx().get_by_encoded_key::<tables::PlainAccountState>(address)?)
@@ -588,29 +576,25 @@ impl<
                         });
                     }
 
-                    match self.earliest_storage_changeset_in_gap(
+                    // Probe StorageChangeSets for the first modification of (address, slot) in
+                    // (max(block_number, hist_tip), exec_tip]. The InPlainState result
+                    // guarantees no changeset for this slot exists in (block_number, hist_tip],
+                    // so starting at max(block_number, hist_tip) saves work without losing
+                    // correctness.
+                    //
+                    // If found at block N (N > block_number): changeset[N].value is the value
+                    // at end of N-1, which equals the value at block_number.
+                    //
+                    // If not found: the slot was not touched after block_number, so PlainState
+                    // still reflects the value at block_number.
+                    let scan_after = self.block_number.max(hist_tip);
+                    if let Some((_, value_before)) = self.earliest_storage_changeset_in_gap(
                         address,
                         storage_key,
-                        hist_tip,
+                        scan_after,
                         exec_tip,
                     )? {
-                        None => {
-                            // Slot was not touched in the gap — PlainState is correct.
-                        }
-                        Some((gap_block, value_before)) => {
-                            if gap_block >= self.block_number {
-                                // First modification at or after the queried block: the
-                                // value before that block equals the value at self.block_number.
-                                return Ok(Some(value_before));
-                            }
-                            // Modification in the gap before the queried block: complex case,
-                            // fall back to the error.
-                            return Err(ProviderError::HistoryStateInconsistent {
-                                block: self.block_number,
-                                execution_tip: exec_tip,
-                                history_tip: hist_tip,
-                            });
-                        }
+                        return Ok(Some(value_before));
                     }
                 }
                 Ok(self
@@ -1350,10 +1334,15 @@ mod tests {
     /// The key scenario is: account last modified at block ≤ hist_tip (so `InPlainState` is
     /// returned), but the same account IS modified again somewhere in the gap (hist_tip, exec_tip].
     /// Without probe, PlainState would be returned which reflects the POST-gap value (wrong).
-    /// With probe:
-    /// - gap_modification block `c ≥ block_number` → return `account_before[c]` (correct)
-    /// - gap_modification block `c < block_number` → error (only when block_number > hist_tip)
-    /// - gap exceeds `MAX_PIPELINE_GAP_FOR_FALLBACK` → error immediately
+    ///
+    /// The probe scans `AccountChangeSets` in `(max(block_number, hist_tip), exec_tip]` and
+    /// returns the pre-value of the first match. That pre-value equals the value at the queried
+    /// block because no changeset for this address exists between the queried block and the
+    /// matched block.
+    ///
+    /// - Match found at block `c > block_number` → return `account_before[c]`
+    /// - No match found → fall through to PlainState (correct: addr not modified after block_number)
+    /// - gap exceeds `MAX_PIPELINE_GAP_FOR_FALLBACK` → error immediately to avoid slow scan
     #[test]
     fn pipeline_consistency_gap_changeset_probe() {
         let factory = create_test_provider_factory();
@@ -1391,10 +1380,8 @@ mod tests {
         };
 
         // ── Case A ──────────────────────────────────────────────────────────────────────────────
-        // block_number=18 ≤ hist_tip=20, InPlainState, gap modification at block 25 ≥ 18.
-        // This is the primary scenario from the reported issue: query well below hist_tip,
-        // address modified in the gap above hist_tip.
-        // → Should return account_before[25] (= acc_before_gap), NOT PlainState.
+        // block_number=18 ≤ hist_tip=20, InPlainState, gap modification at block 25 > 18.
+        // Scan starts at max(18, 20)=20, finds changeset at 25, returns acc_before_gap.
         let provider =
             HistoricalStateProviderRef::new(&db, 18).with_pipeline_consistency(inconsistent);
         let result = provider.basic_account(&ADDRESS);
@@ -1406,12 +1393,12 @@ mod tests {
         );
 
         // ── Case B ──────────────────────────────────────────────────────────────────────────────
-        // block_number=22 > hist_tip=20, InPlainState, gap modification at block 25 ≥ 22.
-        // No modification in (hist_tip=20, block_number=22) so acc_before[25] is still valid.
+        // block_number=22 > hist_tip=20, InPlainState, gap modification at block 25 > 22.
+        // Scan starts at max(22, 20)=22, finds changeset at 25, returns acc_before_gap.
         let provider =
             HistoricalStateProviderRef::new(&db, 22).with_pipeline_consistency(inconsistent);
         let result = provider.basic_account(&ADDRESS);
-        assert!(result.is_ok(), "Case B: gap > hist_tip with c ≥ block_number: {result:?}");
+        assert!(result.is_ok(), "Case B: gap > hist_tip with c > block_number: {result:?}");
         assert_eq!(
             result.unwrap().unwrap().nonce,
             acc_before_gap.nonce,
@@ -1419,14 +1406,18 @@ mod tests {
         );
 
         // ── Case C ──────────────────────────────────────────────────────────────────────────────
-        // block_number=30 > gap_block=25: modification in gap IS before the queried block.
-        // Cannot safely answer → error.
+        // block_number=30 > gap_block=25: the only gap modification is BEFORE the queried block.
+        // Scan starts at 30, finds no changeset in (30, 50], so falls through to PlainState.
+        // PlainState (nonce=99) is correct here because no further modification exists after
+        // block 25, so the value at block 30 equals the value at end of block 50 = PlainState.
         let provider =
             HistoricalStateProviderRef::new(&db, 30).with_pipeline_consistency(inconsistent);
         let result = provider.basic_account(&ADDRESS);
-        assert!(
-            matches!(result, Err(ProviderError::HistoryStateInconsistent { .. })),
-            "Case C: gap modification before query block must error: {result:?}"
+        assert!(result.is_ok(), "Case C: no changeset after block_number → PlainState: {result:?}");
+        assert_eq!(
+            result.unwrap().unwrap().nonce,
+            acc_plain.nonce,
+            "Case C: should return PlainState when no modification exists after block_number"
         );
 
         // ── Case D ──────────────────────────────────────────────────────────────────────────────
