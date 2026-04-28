@@ -6,6 +6,7 @@ use alloy_eips::merge::EPOCH_SLOTS;
 use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbDupCursorRO},
+    models::BlockNumberAddress,
     table::Table,
     tables,
     transaction::DbTx,
@@ -264,6 +265,66 @@ impl<Provider: DBProvider + BlockNumReader> HistoricalStateProviderRef<'_, Provi
     fn tx(&self) -> &Provider::Tx {
         self.provider.tx_ref()
     }
+
+    /// Finds the earliest [`tables::AccountChangeSets`] entry for `address` in the
+    /// half-open interval `(after_block, through_block]`.
+    ///
+    /// Returns `(first_block, account_info_before_that_block)` if a modification was found,
+    /// or `None` when the address was untouched in the window.
+    ///
+    /// Used by the `InPlainState` fallback path to determine whether a gap between the
+    /// execution tip and the history index tip actually affects the queried address.
+    fn earliest_account_changeset_in_gap(
+        &self,
+        address: Address,
+        after_block: BlockNumber,
+        through_block: BlockNumber,
+    ) -> ProviderResult<Option<(BlockNumber, Option<reth_primitives_traits::Account>)>> {
+        let start = after_block.saturating_add(1);
+        if start > through_block {
+            return Ok(None);
+        }
+        // Walk all changeset entries in the block range; AccountChangeSets is a DupSort table
+        // with Key=BlockNumber and SubKey=Address, so walk_range yields every
+        // (block, AccountBeforeTx) pair in the range.
+        let mut cursor = self.tx().cursor_read::<tables::AccountChangeSets>()?;
+        for entry in cursor.walk_range(start..=through_block)? {
+            let (block, account_before) = entry?;
+            if account_before.address == address {
+                return Ok(Some((block, account_before.info)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Finds the earliest [`tables::StorageChangeSets`] entry for `(address, storage_key)` in
+    /// the half-open interval `(after_block, through_block]`.
+    ///
+    /// Returns `(first_block, storage_value_before_that_block)` if a modification was found,
+    /// or `None` when the slot was untouched in the window.
+    fn earliest_storage_changeset_in_gap(
+        &self,
+        address: Address,
+        storage_key: StorageKey,
+        after_block: BlockNumber,
+        through_block: BlockNumber,
+    ) -> ProviderResult<Option<(BlockNumber, StorageValue)>> {
+        let start = after_block.saturating_add(1);
+        if start > through_block {
+            return Ok(None);
+        }
+        // StorageChangeSets is a DupSort table with Key=BlockNumberAddress and SubKey=B256.
+        // Walking the range yields all (BlockNumberAddress, StorageEntry) in the window.
+        let range = BlockNumberAddress::range(start..=through_block);
+        let mut cursor = self.tx().cursor_read::<tables::StorageChangeSets>()?;
+        for entry in cursor.walk_range(range)? {
+            let (bn_addr, storage_entry) = entry?;
+            if bn_addr.address() == address && storage_entry.key == storage_key {
+                return Ok(Some((bn_addr.block_number(), storage_entry.value)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl<
@@ -293,11 +354,56 @@ impl<
                 if let Some((exec_tip, hist_tip)) =
                     self.pipeline_consistency.account_inconsistency()
                 {
-                    return Err(ProviderError::HistoryStateInconsistent {
-                        block: self.block_number,
-                        execution_tip: exec_tip,
-                        history_tip: hist_tip,
-                    })
+                    // The Execution stage has committed PlainState through `exec_tip` while the
+                    // account history index only covers through `hist_tip`. Naively returning
+                    // PlainState would give data from a future block for addresses modified in
+                    // (hist_tip, exec_tip].
+                    //
+                    // For large gaps (initial pipeline sync) reject immediately to avoid an
+                    // expensive changeset scan.
+                    if exec_tip.saturating_sub(hist_tip) > MAX_PIPELINE_GAP_FOR_FALLBACK {
+                        return Err(ProviderError::HistoryStateInconsistent {
+                            block: self.block_number,
+                            execution_tip: exec_tip,
+                            history_tip: hist_tip,
+                        });
+                    }
+
+                    // For small gaps, probe AccountChangeSets for this address in the gap
+                    // (hist_tip, exec_tip]. AccountChangeSets and PlainState are committed
+                    // atomically by the Execution stage, so they are complete through exec_tip.
+                    match self.earliest_account_changeset_in_gap(
+                        *address,
+                        hist_tip,
+                        exec_tip,
+                    )? {
+                        None => {
+                            // Address was not touched in the gap — PlainState holds the
+                            // correct value since no modification has occurred since before
+                            // hist_tip.
+                        }
+                        Some((gap_block, account_before)) => {
+                            if gap_block >= self.block_number {
+                                // The first modification in the gap is at or after the queried
+                                // block. By the InPlainState invariant, no modification exists
+                                // in (self.block_number, hist_tip] (when block_number ≤ hist_tip),
+                                // so `account_before` is the value at self.block_number.
+                                // When block_number > hist_tip and gap_block ≥ block_number,
+                                // no modification in (hist_tip, block_number) means
+                                // `account_before` equals the value at block_number.
+                                return Ok(account_before);
+                            }
+                            // gap_block < self.block_number implies block_number > hist_tip
+                            // and a modification exists in the gap before the queried block.
+                            // Recovering the exact value requires replaying all changesets in
+                            // (hist_tip, block_number], which is not supported here.
+                            return Err(ProviderError::HistoryStateInconsistent {
+                                block: self.block_number,
+                                execution_tip: exec_tip,
+                                history_tip: hist_tip,
+                            });
+                        }
+                    }
                 }
                 Ok(self.tx().get_by_encoded_key::<tables::PlainAccountState>(address)?)
             }
@@ -471,11 +577,41 @@ impl<
                 if let Some((exec_tip, hist_tip)) =
                     self.pipeline_consistency.storage_inconsistency()
                 {
-                    return Err(ProviderError::HistoryStateInconsistent {
-                        block: self.block_number,
-                        execution_tip: exec_tip,
-                        history_tip: hist_tip,
-                    })
+                    // Same reasoning as in `basic_account`: reject large gaps immediately,
+                    // and for small gaps probe the storage changeset to determine whether
+                    // this specific slot was modified in the gap.
+                    if exec_tip.saturating_sub(hist_tip) > MAX_PIPELINE_GAP_FOR_FALLBACK {
+                        return Err(ProviderError::HistoryStateInconsistent {
+                            block: self.block_number,
+                            execution_tip: exec_tip,
+                            history_tip: hist_tip,
+                        });
+                    }
+
+                    match self.earliest_storage_changeset_in_gap(
+                        address,
+                        storage_key,
+                        hist_tip,
+                        exec_tip,
+                    )? {
+                        None => {
+                            // Slot was not touched in the gap — PlainState is correct.
+                        }
+                        Some((gap_block, value_before)) => {
+                            if gap_block >= self.block_number {
+                                // First modification at or after the queried block: the
+                                // value before that block equals the value at self.block_number.
+                                return Ok(Some(value_before));
+                            }
+                            // Modification in the gap before the queried block: complex case,
+                            // fall back to the error.
+                            return Err(ProviderError::HistoryStateInconsistent {
+                                block: self.block_number,
+                                execution_tip: exec_tip,
+                                history_tip: hist_tip,
+                            });
+                        }
+                    }
                 }
                 Ok(self
                     .tx()
@@ -565,6 +701,15 @@ impl<Provider: DBProvider + ChangeSetReader + BlockNumReader> HistoricalStatePro
 
 // Delegates all provider impls to [HistoricalStateProviderRef]
 reth_storage_api::macros::delegate_provider_impls!(HistoricalStateProvider<Provider> where [Provider: DBProvider + BlockNumReader + BlockHashReader + ChangeSetReader + StorageSettingsCache + RocksDBProviderFactory + NodePrimitivesProvider]);
+
+/// Maximum gap between the execution tip and the history index tip for which the
+/// `InPlainState` fallback is still willing to probe the changeset instead of immediately
+/// returning a [`ProviderError::HistoryStateInconsistent`] error.
+///
+/// For small gaps (typical re-sync scenario) we scan `AccountChangeSets` /
+/// `StorageChangeSets` for the queried address/slot. For large gaps (initial pipeline sync)
+/// the scan would be prohibitively expensive, so we fall back to the error directly.
+const MAX_PIPELINE_GAP_FOR_FALLBACK: u64 = 1_000;
 
 /// Cached pipeline stage checkpoint info used to detect inconsistent `InPlainState` reads.
 ///
@@ -1101,7 +1246,9 @@ mod tests {
 
     /// Verifies selective rejection during pipeline inconsistency:
     /// - Accounts resolving via changeset path → return correct data (not blocked)
-    /// - Accounts resolving via `InPlainState` path → return `HistoryStateInconsistent` error
+    /// - Accounts resolving via `InPlainState` with address untouched in the gap → return PlainState
+    /// - Accounts resolving via `InPlainState` with address touched in the gap → consult changeset
+    /// - Large gaps → `HistoryStateInconsistent` error regardless
     #[test]
     fn pipeline_consistency_selective_rejection() {
         let factory = create_test_provider_factory();
@@ -1121,7 +1268,7 @@ mod tests {
         )
         .unwrap();
 
-        // Changesets for ADDRESS
+        // Changesets for ADDRESS within the history-covered range (blocks ≤ hist_tip=15)
         let acc_at7 = Account { nonce: 7, balance: U256::ZERO, bytecode_hash: None };
         let acc_at10 = Account { nonce: 10, balance: U256::ZERO, bytecode_hash: None };
         tx.put::<tables::AccountChangeSets>(
@@ -1158,18 +1305,22 @@ mod tests {
         assert!(result.is_ok(), "Changeset path should work during inconsistency: {result:?}");
         assert_eq!(result.unwrap().unwrap().nonce, 7);
 
-        // Test 2: ADDRESS at block 16 → no entry after 16 → InPlainState → BLOCKED
+        // Test 2: ADDRESS at block 16 → InPlainState with NO changeset in gap (15, 200]
+        // → address untouched in gap → PlainState is correct
         let provider =
             HistoricalStateProviderRef::new(&db, 16).with_pipeline_consistency(inconsistent);
         let result = provider.basic_account(&ADDRESS);
         assert!(
-            matches!(result, Err(ProviderError::HistoryStateInconsistent { .. })),
-            "InPlainState should be blocked: {result:?}"
+            result.is_ok(),
+            "InPlainState with no gap modification should succeed: {result:?}"
+        );
+        assert_eq!(
+            result.unwrap().unwrap().nonce,
+            acc_plain.nonce,
+            "Should return PlainState value when address untouched in gap"
         );
 
         // Test 3: no_history_addr at block 5 → never written to history → NotYetWritten → Ok(None)
-        // This is correct: accounts that never existed in history return None regardless of
-        // pipeline consistency, because they were never modified by any block.
         let provider =
             HistoricalStateProviderRef::new(&db, 5).with_pipeline_consistency(inconsistent);
         let result = provider.basic_account(&no_history_addr);
@@ -1192,5 +1343,105 @@ mod tests {
             HistoricalStateProviderRef::new(&db, 5).with_pipeline_consistency(consistent);
         let result = provider.basic_account(&no_history_addr);
         assert!(result.is_ok(), "Should succeed when consistent: {result:?}");
+    }
+
+    /// Tests the gap changeset probe logic:
+    ///
+    /// The key scenario is: account last modified at block ≤ hist_tip (so `InPlainState` is
+    /// returned), but the same account IS modified again somewhere in the gap (hist_tip, exec_tip].
+    /// Without probe, PlainState would be returned which reflects the POST-gap value (wrong).
+    /// With probe:
+    /// - gap_modification block `c ≥ block_number` → return `account_before[c]` (correct)
+    /// - gap_modification block `c < block_number` → error (only when block_number > hist_tip)
+    /// - gap exceeds `MAX_PIPELINE_GAP_FOR_FALLBACK` → error immediately
+    #[test]
+    fn pipeline_consistency_gap_changeset_probe() {
+        let factory = create_test_provider_factory();
+        let tx = factory.provider_rw().unwrap().into_tx();
+
+        // ADDRESS: history index records modifications at blocks 10 and 15.
+        // Both are below hist_tip=20, so any query with block_number > 15 gets InPlainState.
+        tx.put::<tables::AccountsHistory>(
+            ShardedKey { key: ADDRESS, highest_block_number: u64::MAX },
+            BlockNumberList::new([10, 15]).unwrap(),
+        )
+        .unwrap();
+
+        // In the gap (hist_tip=20, exec_tip=50]: ADDRESS is modified at block 25.
+        // account_before[25] = state just before block 25 executes = state at any block in [16, 24].
+        let acc_before_gap = Account { nonce: 20, balance: U256::ZERO, bytecode_hash: None };
+        tx.put::<tables::AccountChangeSets>(
+            25,
+            AccountBeforeTx { address: ADDRESS, info: Some(acc_before_gap) },
+        )
+        .unwrap();
+
+        // PlainState reflects state after block 50 (post-gap modification) — wrong for older queries.
+        let acc_plain = Account { nonce: 99, balance: U256::ZERO, bytecode_hash: None };
+        tx.put::<tables::PlainAccountState>(ADDRESS, acc_plain).unwrap();
+        tx.commit().unwrap();
+
+        let db = factory.provider().unwrap();
+
+        // exec=50, hist=20 → gap of 30 blocks (below MAX_PIPELINE_GAP_FOR_FALLBACK=1000)
+        let inconsistent = PipelineConsistency {
+            execution_tip: Some(50),
+            account_history_tip: Some(20),
+            storage_history_tip: Some(20),
+        };
+
+        // ── Case A ──────────────────────────────────────────────────────────────────────────────
+        // block_number=18 ≤ hist_tip=20, InPlainState, gap modification at block 25 ≥ 18.
+        // This is the primary scenario from the reported issue: query well below hist_tip,
+        // address modified in the gap above hist_tip.
+        // → Should return account_before[25] (= acc_before_gap), NOT PlainState.
+        let provider =
+            HistoricalStateProviderRef::new(&db, 18).with_pipeline_consistency(inconsistent);
+        let result = provider.basic_account(&ADDRESS);
+        assert!(result.is_ok(), "Case A: gap-probe path should succeed: {result:?}");
+        assert_eq!(
+            result.unwrap().unwrap().nonce,
+            acc_before_gap.nonce,
+            "Case A: should return account_before of earliest gap changeset"
+        );
+
+        // ── Case B ──────────────────────────────────────────────────────────────────────────────
+        // block_number=22 > hist_tip=20, InPlainState, gap modification at block 25 ≥ 22.
+        // No modification in (hist_tip=20, block_number=22) so acc_before[25] is still valid.
+        let provider =
+            HistoricalStateProviderRef::new(&db, 22).with_pipeline_consistency(inconsistent);
+        let result = provider.basic_account(&ADDRESS);
+        assert!(result.is_ok(), "Case B: gap > hist_tip with c ≥ block_number: {result:?}");
+        assert_eq!(
+            result.unwrap().unwrap().nonce,
+            acc_before_gap.nonce,
+            "Case B: should return account_before of earliest gap changeset"
+        );
+
+        // ── Case C ──────────────────────────────────────────────────────────────────────────────
+        // block_number=30 > gap_block=25: modification in gap IS before the queried block.
+        // Cannot safely answer → error.
+        let provider =
+            HistoricalStateProviderRef::new(&db, 30).with_pipeline_consistency(inconsistent);
+        let result = provider.basic_account(&ADDRESS);
+        assert!(
+            matches!(result, Err(ProviderError::HistoryStateInconsistent { .. })),
+            "Case C: gap modification before query block must error: {result:?}"
+        );
+
+        // ── Case D ──────────────────────────────────────────────────────────────────────────────
+        // Gap exceeds MAX_PIPELINE_GAP_FOR_FALLBACK → error immediately without scanning.
+        let huge_gap = PipelineConsistency {
+            execution_tip: Some(100_000),
+            account_history_tip: Some(20),
+            storage_history_tip: Some(20),
+        };
+        let provider =
+            HistoricalStateProviderRef::new(&db, 18).with_pipeline_consistency(huge_gap);
+        let result = provider.basic_account(&ADDRESS);
+        assert!(
+            matches!(result, Err(ProviderError::HistoryStateInconsistent { .. })),
+            "Case D: large gap must immediately return error: {result:?}"
+        );
     }
 }
