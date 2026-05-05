@@ -284,14 +284,17 @@ impl<Provider: DBProvider + BlockNumReader> HistoricalStateProviderRef<'_, Provi
         if start > through_block {
             return Ok(None);
         }
-        // Walk all changeset entries in the block range; AccountChangeSets is a DupSort table
-        // with Key=BlockNumber and SubKey=Address, so walk_range yields every
-        // (block, AccountBeforeTx) pair in the range.
-        let mut cursor = self.tx().cursor_read::<tables::AccountChangeSets>()?;
-        for entry in cursor.walk_range(start..=through_block)? {
-            let (block, account_before) = entry?;
-            if account_before.address == address {
-                return Ok(Some((block, account_before.info)));
+        // AccountChangeSets is DupSort with Key=BlockNumber, SubKey=Address.
+        // Per-block point lookup is O(log n) per block; walking the whole range would
+        // touch every account modified by every block in the window (millions of entries
+        // for a 10k-block gap on BSC) and is unacceptably slow when invoked once per
+        // slot read during trace replay.
+        let mut cursor = self.tx().cursor_dup_read::<tables::AccountChangeSets>()?;
+        for block in start..=through_block {
+            if let Some(account_before) = cursor.seek_by_key_subkey(block, address)? {
+                if account_before.address == address {
+                    return Ok(Some((block, account_before.info)));
+                }
             }
         }
         Ok(None)
@@ -313,14 +316,17 @@ impl<Provider: DBProvider + BlockNumReader> HistoricalStateProviderRef<'_, Provi
         if start > through_block {
             return Ok(None);
         }
-        // StorageChangeSets is a DupSort table with Key=BlockNumberAddress and SubKey=B256.
-        // Walking the range yields all (BlockNumberAddress, StorageEntry) in the window.
-        let range = BlockNumberAddress::range(start..=through_block);
-        let mut cursor = self.tx().cursor_read::<tables::StorageChangeSets>()?;
-        for entry in cursor.walk_range(range)? {
-            let (bn_addr, storage_entry) = entry?;
-            if bn_addr.address() == address && storage_entry.key == storage_key {
-                return Ok(Some((bn_addr.block_number(), storage_entry.value)));
+        // StorageChangeSets is DupSort with Key=BlockNumberAddress, SubKey=B256 (storage key).
+        // Point lookup per (block, address) is O(log n); walking the full range scans every
+        // storage slot mutated by every block, which is millions of entries for a 10k-block
+        // gap on BSC and unworkable when invoked per slot read during trace replay.
+        let mut cursor = self.tx().cursor_dup_read::<tables::StorageChangeSets>()?;
+        for block in start..=through_block {
+            let bn_addr = BlockNumberAddress((block, address));
+            if let Some(entry) = cursor.seek_by_key_subkey(bn_addr, storage_key)? {
+                if entry.key == storage_key {
+                    return Ok(Some((block, entry.value)));
+                }
             }
         }
         Ok(None)
