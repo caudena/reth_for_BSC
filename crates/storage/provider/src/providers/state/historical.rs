@@ -693,7 +693,7 @@ reth_storage_api::macros::delegate_provider_impls!(HistoricalStateProvider<Provi
 /// For small gaps (typical re-sync scenario) we scan `AccountChangeSets` /
 /// `StorageChangeSets` for the queried address/slot. For large gaps (initial pipeline sync)
 /// the scan would be prohibitively expensive, so we fall back to the error directly.
-const MAX_PIPELINE_GAP_FOR_FALLBACK: u64 = 1_000;
+const MAX_PIPELINE_GAP_FOR_FALLBACK: u64 = 10_000;
 
 /// Cached pipeline stage checkpoint info used to detect inconsistent `InPlainState` reads.
 ///
