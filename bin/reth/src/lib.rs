@@ -52,7 +52,8 @@
 
 // Used in feature flags only (`asm-keccak`, `keccak-cache-global`)
 use alloy_primitives as _;
-
+/// rpc_ext
+pub mod rpc_ext;
 pub mod cli;
 
 /// Re-exported utils.

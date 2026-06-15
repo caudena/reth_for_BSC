@@ -17,6 +17,8 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
+use reth::rpc_ext::{self, EthBlockReceiptsTraceApiServer};
+
 fn main() {
     reth_cli_util::sigsegv_handler::install();
 
@@ -27,7 +29,14 @@ fn main() {
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "reth::cli", "Launching node");
-        let handle = builder.node(EthereumNode::default()).launch_with_debug_capabilities().await?;
+        let handle = builder.node(EthereumNode::default())
+            .extend_rpc_modules(move |ctx| {
+                let trace_ext =
+                    rpc_ext::EthBlockReceiptsTraceExt::new(ctx.registry.eth_api().clone());
+                ctx.modules.merge_configured(trace_ext.into_rpc())?;
+                Ok(())
+            })
+            .launch_with_debug_capabilities().await?;
 
         handle.wait_for_node_exit().await
     }) {

@@ -804,7 +804,7 @@ pub struct BlockStorageAccess {
 
 /// Helper to construct a [`LocalizedTransactionTrace`] that describes a reward to the block
 /// beneficiary.
-fn reward_trace<H: BlockHeader>(
+pub (crate) fn reward_trace<H: BlockHeader>(
     block_hash: BlockHash,
     header: &H,
     reward: RewardAction,

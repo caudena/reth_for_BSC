@@ -1,6 +1,6 @@
 //! Loads chain metadata.
 
-use alloy_primitives::{U256, U64};
+use alloy_primitives::{BlockHash, U256, U64};
 use alloy_rpc_types_eth::{Stage, SyncInfo, SyncStatus};
 use futures::Future;
 use reth_chainspec::ChainInfo;
@@ -10,6 +10,11 @@ use reth_rpc_convert::RpcTxReq;
 use reth_storage_api::{BlockNumReader, StageCheckpointReader, TransactionsProvider};
 
 use crate::{helpers::EthSigner, EthApiTypes, RpcNodeCore};
+
+//Custom imports
+use alloy_rpc_types_trace::parity::LocalizedTransactionTrace;
+use reth_primitives_traits::BlockHeader;
+use reth_rpc_eth_types::EthApiError;
 
 /// `Eth` API trait.
 ///
@@ -70,8 +75,23 @@ pub trait EthApiSpec: RpcNodeCore + EthApiTypes {
         };
         Ok(status)
     }
-}
 
+///Calculate block rewards
+fn calculate_base_block_reward<H: BlockHeader>(
+    &self,
+    header: &H,
+) -> Result<Option<u128>, EthApiError>;
+
+///Extract block rewards
+fn extract_reward_traces<H: BlockHeader>(
+    &self,
+    header: &H,
+    block_hash: BlockHash,
+    ommers: Option<&[H]>,
+    base_block_reward: u128,
+) -> Vec<LocalizedTransactionTrace>;
+
+}
 /// A handle to [`EthSigner`]s with its generics set from [`TransactionsProvider`] and
 /// [`reth_rpc_convert::RpcTypes`].
 pub type SignersForRpc<Provider, Rpc> = parking_lot::RwLock<
