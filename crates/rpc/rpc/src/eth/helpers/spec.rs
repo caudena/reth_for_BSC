@@ -9,7 +9,7 @@ use crate::EthApi;
 use crate::trace::reward_trace;
 use alloy_evm::block::calc::{base_block_reward_pre_merge, block_reward, ommer_reward};
 use alloy_rpc_types_trace::parity::{LocalizedTransactionTrace, RewardAction, RewardType};
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardfork, EthereumHardforks, SEPOLIA};
+use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_primitives_traits::BlockHeader;
 
 impl<N, Rpc> EthApiSpec for EthApi<N, Rpc>
