@@ -255,22 +255,21 @@ where
         })
     }
 
-    fn earliest_account_changeset_in_gap(
+    fn earliest_account_changeset_from(
         &self,
         address: Address,
-        after_block: BlockNumber,
+        from_block: BlockNumber,
         through_block: BlockNumber,
     ) -> ProviderResult<Option<(BlockNumber, Option<Account>)>>
     where
         Provider: StorageSettingsCache,
     {
-        let start = after_block.saturating_add(1);
-        if start > through_block {
+        if from_block > through_block {
             return Ok(None)
         }
 
         if self.provider.cached_storage_settings().storage_v2 {
-            for block in start..=through_block {
+            for block in from_block..=through_block {
                 if let Some(account_before) =
                     self.provider.get_account_before_block(block, address)?
                 {
@@ -281,7 +280,7 @@ where
         }
 
         let mut cursor = self.tx().cursor_dup_read::<tables::AccountChangeSets>()?;
-        for block in start..=through_block {
+        for block in from_block..=through_block {
             if let Some(account_before) = cursor.seek_by_key_subkey(block, address)? {
                 if account_before.address == address {
                     return Ok(Some((block, account_before.info)))
@@ -292,23 +291,22 @@ where
         Ok(None)
     }
 
-    fn earliest_storage_changeset_in_gap(
+    fn earliest_storage_changeset_from(
         &self,
         address: Address,
         storage_key: StorageKey,
-        after_block: BlockNumber,
+        from_block: BlockNumber,
         through_block: BlockNumber,
     ) -> ProviderResult<Option<(BlockNumber, StorageValue)>>
     where
         Provider: StorageSettingsCache,
     {
-        let start = after_block.saturating_add(1);
-        if start > through_block {
+        if from_block > through_block {
             return Ok(None)
         }
 
         if self.provider.cached_storage_settings().storage_v2 {
-            for block in start..=through_block {
+            for block in from_block..=through_block {
                 if let Some(entry) =
                     self.provider.get_storage_before_block(block, address, storage_key)?
                 {
@@ -319,7 +317,7 @@ where
         }
 
         let mut cursor = self.tx().cursor_dup_read::<tables::StorageChangeSets>()?;
-        for block in start..=through_block {
+        for block in from_block..=through_block {
             if let Some(entry) =
                 cursor.seek_by_key_subkey(BlockNumberAddress((block, address)), storage_key)?
             {
@@ -357,13 +355,11 @@ where
             return Err(self.pipeline_gap_error(execution_tip, history_tip))
         }
 
-        let scan_after = history_tip.max(self.block_number.saturating_sub(1));
-        match self.earliest_account_changeset_in_gap(address, scan_after, execution_tip)? {
+        let first_unindexed_block = history_tip.saturating_add(1);
+        let scan_from = first_unindexed_block.max(self.block_number);
+        match self.earliest_account_changeset_from(address, scan_from, execution_tip)? {
             None => Ok(None),
-            Some((gap_block, account_before)) if gap_block >= self.block_number => {
-                Ok(Some(account_before))
-            }
-            Some(_) => Err(self.pipeline_gap_error(execution_tip, history_tip)),
+            Some((_, account_before)) => Ok(Some(account_before)),
         }
     }
 
@@ -381,18 +377,16 @@ where
             return Err(self.pipeline_gap_error(execution_tip, history_tip))
         }
 
-        let scan_after = history_tip.max(self.block_number.saturating_sub(1));
-        match self.earliest_storage_changeset_in_gap(
+        let first_unindexed_block = history_tip.saturating_add(1);
+        let scan_from = first_unindexed_block.max(self.block_number);
+        match self.earliest_storage_changeset_from(
             address,
             storage_key,
-            scan_after,
+            scan_from,
             execution_tip,
         )? {
             None => Ok(None),
-            Some((gap_block, value_before)) if gap_block >= self.block_number => {
-                Ok(Some(value_before))
-            }
-            Some(_) => Err(self.pipeline_gap_error(execution_tip, history_tip)),
+            Some((_, value_before)) => Ok(Some(value_before)),
         }
     }
 
