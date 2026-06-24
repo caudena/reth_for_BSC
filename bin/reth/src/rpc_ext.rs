@@ -11,7 +11,7 @@ use alloy_rpc_types_trace::parity::{
 use futures::join;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use jsonrpsee_types::ErrorObjectOwned;
-use reth_node_api::BlockBody;
+//use reth_node_api::BlockBody;
 use reth_rpc_convert::CustomRpcHeader;
 use reth_rpc_eth_api::helpers::{EthBlocks, FullEthApi, Trace};
 use revm_inspectors::tracing::TracingInspectorConfig;
@@ -203,32 +203,32 @@ where
             .map_err(|e| ErrorObjectOwned::owned(1, e.to_string(), None::<()>))?
             .unwrap();
 
-        let block_rewards_task = tokio::spawn({
-            let eth_api = self.eth_api.clone();
-
-            let number = number.as_number().unwrap();
-
-            async move {
-                let maybe_block =
-                    eth_api.recovered_block(BlockId::number(number)).await.unwrap();
-                let mut trace_rewards: Vec<LocalizedTransactionTrace> = Vec::new();
-
-                if let Some(block) = maybe_block {
-                    if let Ok(Some(base_block_reward)) =
-                        eth_api.calculate_base_block_reward(block.header())
-                    {
-                        trace_rewards.extend(eth_api.extract_reward_traces(
-                            block.header(),
-                            block.hash(),
-                            block.body().ommers(),
-                            base_block_reward,
-                        ));
-                    }
-                }
-
-                trace_rewards
-            }
-        });
+        // let block_rewards_task = tokio::spawn({
+        //     let eth_api = self.eth_api.clone();
+        //
+        //     let number = number.as_number().unwrap();
+        //
+        //     async move {
+        //         let maybe_block =
+        //             eth_api.recovered_block(BlockId::number(number)).await.unwrap();
+        //         let mut trace_rewards: Vec<LocalizedTransactionTrace> = Vec::new();
+        //
+        //         if let Some(block) = maybe_block {
+        //             if let Ok(Some(base_block_reward)) =
+        //                 eth_api.calculate_base_block_reward(block.header())
+        //             {
+        //                 trace_rewards.extend(eth_api.extract_reward_traces(
+        //                     block.header(),
+        //                     block.hash(),
+        //                     block.body().ommers(),
+        //                     base_block_reward,
+        //                 ));
+        //             }
+        //         }
+        //
+        //         trace_rewards
+        //     }
+        // });
 
         if trx_receipts.len() != block.transactions.len() {
             let trx_trace_len_error = ErrorObjectOwned::owned(
@@ -367,9 +367,9 @@ where
         };
 
         #[allow(unused_assignments, unused_mut)]
-        let mut block_rewards = vec![];
+        let block_rewards = vec![];
 
-        block_rewards = block_rewards_task.await.unwrap();
+        //block_rewards = block_rewards_task.await.unwrap();
 
         let rich_block: EnrichedBlock = EnrichedBlock { inner: e_block, rewards: block_rewards };
 
