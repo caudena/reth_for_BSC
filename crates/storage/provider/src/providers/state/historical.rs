@@ -36,7 +36,7 @@ use reth_trie_db::{
 
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
-const MAX_PIPELINE_GAP_FOR_FALLBACK: BlockNumber = 10_000;
+const MAX_PIPELINE_GAP_FOR_FALLBACK: BlockNumber = 100_000;
 
 type DbStateRoot<'a, TX, A> = StateRoot<
     reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
