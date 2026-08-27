@@ -80,7 +80,21 @@ where
     ) -> RpcResult<Option<EnrichedBlock>> {
         trace!(target: "rpc::eth", ?number, ?true, "Serving eth_getBlockReceiptTrace");
 
-        let trace_task = tokio::spawn({
+        // Replaying a whole block under a tracing inspector is CPU-bound and
+        // allocation-heavy. Without a permit these run on tokio's blocking pool
+        // with no concurrency limit, and enough of them in parallel starve block
+        // validation of cores — which drops the node behind the chain head and
+        // triggers fork recovery. Every other tracing endpoint takes this permit
+        // for the same reason.
+        let _permit = self.eth_api.acquire_owned_tracing().await.map_err(|err| {
+            ErrorObjectOwned::owned(
+                1,
+                format!("Failed to acquire tracing permit for block {}: {}", number, err),
+                None::<()>,
+            )
+        })?;
+
+        let trace_fut = {
             let eth_api = self.eth_api.clone();
 
             async move {
@@ -123,27 +137,22 @@ where
                     )
                     .await
             }
-        });
+        };
 
-        let receipts_task = tokio::spawn({
+        let receipts_fut = {
             let eth_api = self.eth_api.clone();
 
             async move { EthBlocks::block_receipts(&eth_api, number.into()).await }
-        });
+        };
 
-        let (trx_traces_handle, trx_receipts_handle) = join!(trace_task, receipts_task);
+        // Joined rather than spawned: a spawned task detaches when the caller
+        // goes away, so a client that disconnects or times out leaves a full
+        // block replay running and holding its memory. Both futures dispatch
+        // their heavy work to the blocking pool internally, so nothing is
+        // serialised by joining them here.
+        let (trx_traces_res, trx_receipts_res) = join!(trace_fut, receipts_fut);
 
-        let trx_traces_handle_res = trx_traces_handle
-            .map_err(|handle_err| {
-                ErrorObjectOwned::owned(
-                    1,
-                    format!(
-                        "Error in traces join handle for block number {}: {}",
-                        number, handle_err
-                    ),
-                    None::<()>,
-                )
-            })?
+        let trx_traces_handle_res = trx_traces_res
             .map_err(|trace_res_err| {
                 ErrorObjectOwned::owned(
                     1,
@@ -164,17 +173,7 @@ where
                 })
             });
 
-        let trx_receipts_handle_res = trx_receipts_handle
-            .map_err(|handle_err| {
-                ErrorObjectOwned::owned(
-                    1,
-                    format!(
-                        "Error in transaction receipts for block number {}: {}",
-                        number, handle_err
-                    ),
-                    None::<()>,
-                )
-            })?
+        let trx_receipts_handle_res = trx_receipts_res
             .map_err(|receipt_res_err| {
                 ErrorObjectOwned::owned(
                     2,
