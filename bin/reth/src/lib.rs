@@ -52,6 +52,9 @@
 
 // Used in feature flags only (`asm-keccak`, `keccak-cache-global`)
 use alloy_primitives as _;
+// Kept for the `rt` feature it contributes to the workspace's tokio unification;
+// no longer referenced directly since `rpc_ext` stopped spawning detached tasks.
+use tokio as _;
 /// rpc_ext
 pub mod rpc_ext;
 pub mod cli;

@@ -81,11 +81,14 @@ where
         trace!(target: "rpc::eth", ?number, ?true, "Serving eth_getBlockReceiptTrace");
 
         // Replaying a whole block under a tracing inspector is CPU-bound and
-        // allocation-heavy. Without a permit these run on tokio's blocking pool
-        // with no concurrency limit, and enough of them in parallel starve block
-        // validation of cores — which drops the node behind the chain head and
-        // triggers fork recovery. Every other tracing endpoint takes this permit
-        // for the same reason.
+        // allocation-heavy, and `trace_block_with` dispatches it through
+        // `spawn_blocking`, so each call occupies a tokio blocking-pool thread
+        // for its whole duration. The permit does not change where that work
+        // runs — it bounds how many such replays exist at once. The pool grows
+        // to 512 threads, so left unbounded enough concurrent calls oversubscribe
+        // every core and starve block validation, which drops the node behind
+        // the chain head and triggers fork recovery. Every other tracing
+        // endpoint takes this permit for the same reason.
         let _permit = self.eth_api.acquire_owned_tracing().await.map_err(|err| {
             ErrorObjectOwned::owned(
                 1,
